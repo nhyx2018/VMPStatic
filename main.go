@@ -80,15 +80,6 @@ type VMPResult struct {
 	Options  string
 }
 
-type MutationAnalysis struct {
-	Level               string
-	Entropy             float64
-	VirtualizedHandlers int
-	CodeComplexity      float64
-	VMPSectionSize      uint32
-	Confidence          int
-}
-
 func (r VMPResult) String() string {
 	if !r.Detected {
 		return "VMProtect: Not detected"
@@ -113,7 +104,7 @@ func parsePE(data []byte) (*PEFile, error) {
 	}
 
 	lfanew := int(int32(binary.LittleEndian.Uint32(data[60:64])))
-	if lfanew+24 > len(data) {
+	if lfanew < 0 || lfanew+24 > len(data) {
 		return nil, fmt.Errorf("NT headers offset 0x%X is out of file bounds", lfanew)
 	}
 
@@ -137,6 +128,18 @@ func parsePE(data []byte) (*PEFile, error) {
 
 	magic := binary.LittleEndian.Uint16(data[ohOff : ohOff+2])
 	pe.is64 = (magic == pe32PlusMagic)
+
+	// Every fixed field read below lies within the first 112 (PE32+) or 96
+	// (PE32) bytes of the optional header; the data directories follow. Require
+	// the fixed part and whatever SizeOfOptionalHeader claims to both be present
+	// so a truncated file returns an error instead of panicking.
+	minOptHeader := 96
+	if pe.is64 {
+		minOptHeader = 112
+	}
+	if ohOff+minOptHeader > len(data) || ohOff+sizeOfOptHeader > len(data) {
+		return nil, fmt.Errorf("optional header (%d bytes) is out of file bounds", sizeOfOptHeader)
+	}
 	pe.entryPointRVA = binary.LittleEndian.Uint32(data[ohOff+16 : ohOff+20])
 
 	if pe.is64 {
@@ -306,14 +309,6 @@ func (pe *PEFile) getEntryPointSection() int {
 	return -1
 }
 
-func detectVMProtect(data []byte) VMPResult {
-	pe, err := parsePE(data)
-	if err != nil {
-		return VMPResult{}
-	}
-	return detectVMProtectPE(pe)
-}
-
 func detectVMProtectPE(pe *PEFile) VMPResult {
 	if pe.isNetAssembly() {
 		return VMPResult{}
@@ -344,10 +339,14 @@ func detectVMProtectPE(pe *PEFile) VMPResult {
 
 	result = checkPackedVariant(pe.data, pe, result)
 
-	if result.Detected && len(pe.sections) < 3 {
-		if len(pe.sections) == 3 && pe.sections[0].SizeOfRawData == 0 {
+	// VMProtect output always carries at least the original code, the stub and
+	// the packed data. Reject too-small layouts, and the three-section case
+	// where the first section has no raw data (not a real packed image).
+	if result.Detected {
+		switch {
+		case len(pe.sections) < 3:
 			result.Detected = false
-		} else if len(pe.sections) < 3 {
+		case len(pe.sections) == 3 && pe.sections[0].SizeOfRawData == 0:
 			result.Detected = false
 		}
 	}
@@ -979,7 +978,9 @@ func matchesAtOffset(data, pattern []byte, offset int) bool {
 	return true
 }
 
-func decompressLZMA(props, compressed []byte) ([]byte, error) {
+// newLZMAReader wraps a raw VMProtect block (no header, unknown size) in the
+// 13-byte header the lzma package expects.
+func newLZMAReader(props, compressed []byte) (io.Reader, error) {
 	if len(props) != lzmaPropsSize {
 		return nil, fmt.Errorf("LZMA props must be %d bytes, got %d", lzmaPropsSize, len(props))
 	}
@@ -988,17 +989,25 @@ func decompressLZMA(props, compressed []byte) ([]byte, error) {
 	copy(header[:5], props)
 	binary.LittleEndian.PutUint64(header[5:], 0xFFFFFFFFFFFFFFFF)
 
-	stream := io.MultiReader(
+	r, err := lzma.NewReader(io.MultiReader(
 		bytes.NewReader(header),
 		bytes.NewReader(compressed),
-	)
-
-	r, err := lzma.NewReader(stream)
+	))
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialise LZMA reader: %w", err)
 	}
+	return r, nil
+}
 
-	return io.ReadAll(r)
+// decompressLZMA decodes at most limit bytes. The block header does not carry a
+// size, so without the cap a corrupt or hostile stream could expand without
+// bound; the caller already knows how much room the destination has.
+func decompressLZMA(props, compressed []byte, limit int) ([]byte, error) {
+	r, err := newLZMAReader(props, compressed)
+	if err != nil {
+		return nil, err
+	}
+	return io.ReadAll(io.LimitReader(r, int64(limit)))
 }
 
 // packedSections lists the sections whose contents the packer moved into LZMA
@@ -1145,14 +1154,7 @@ func findPackerInfoV39(pe *PEFile, dests []SectionInfo) (int, []PackerInfo, bool
 // probeLZMA reports whether compressed starts a stream that decodes far enough to
 // be worth trusting. Blocks shorter than the probe size count as a pass.
 func probeLZMA(props, compressed []byte) bool {
-	header := make([]byte, 13)
-	copy(header[:5], props)
-	binary.LittleEndian.PutUint64(header[5:], 0xFFFFFFFFFFFFFFFF)
-
-	r, err := lzma.NewReader(io.MultiReader(
-		bytes.NewReader(header),
-		bytes.NewReader(compressed),
-	))
+	r, err := newLZMAReader(props, compressed)
 	if err != nil {
 		return false
 	}
@@ -1163,14 +1165,6 @@ func probeLZMA(props, compressed []byte) bool {
 		return n > 0
 	}
 	return err == nil
-}
-
-func unpackPE(data []byte) ([]byte, error) {
-	pe, err := parsePE(data)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse packed PE: %w", err)
-	}
-	return unpackPEFile(pe, nil)
 }
 
 func unpackPEFile(pe *PEFile, loc *packerLocate) ([]byte, error) {
@@ -1241,16 +1235,11 @@ func unpackPEFile(pe *PEFile, loc *packerLocate) ([]byte, error) {
 			return nil, fmt.Errorf("block %d: destination RVA 0x%X is outside unpacked image", i, entry.Dst)
 		}
 
-		compressedData := data[compRawOff:]
-		decompressed, err := decompressLZMA(lzmaProps, compressedData)
-		if err != nil {
-			return nil, fmt.Errorf("block %d: LZMA decompression failed: %w", i, err)
-		}
-
 		dstOff := int(entry.Dst)
 		available := len(unpacked) - dstOff
-		if len(decompressed) > available {
-			decompressed = decompressed[:available]
+		decompressed, err := decompressLZMA(lzmaProps, data[compRawOff:], available)
+		if err != nil {
+			return nil, fmt.Errorf("block %d: LZMA decompression failed: %w", i, err)
 		}
 		copy(unpacked[dstOff:], decompressed)
 
@@ -1259,69 +1248,6 @@ func unpackPEFile(pe *PEFile, loc *packerLocate) ([]byte, error) {
 	}
 
 	return unpacked, nil
-}
-
-func getVMPSections(pe *PEFile) []int {
-	var vmpSections []int
-	relocIdx := pe.getRelocsSection()
-	rsrcIdx := pe.getResourceSection()
-
-	for i, s := range pe.sections {
-		if i == relocIdx || i == rsrcIdx {
-			continue
-		}
-
-		name := s.Name
-		if strings.HasPrefix(name, ".vmp") ||
-			(len(name) > 0 && name[len(name)-1] >= '0' && name[len(name)-1] <= '3') {
-			vmpSections = append(vmpSections, i)
-			continue
-		}
-
-		isExecutable := s.Characteristics&sectionMemExecute != 0
-		isHighEntropy := s.VirtualSize > 0 && s.SizeOfRawData > 0
-		isVirtualOnly := s.SizeOfRawData == 0 && s.VirtualSize > 0
-
-		if (isExecutable && isHighEntropy) || isVirtualOnly {
-			ep := pe.entryPointRVA
-			if ep >= s.VirtualAddress && ep < s.VirtualAddress+s.VirtualSize {
-				vmpSections = append(vmpSections, i)
-			}
-		}
-	}
-
-	return vmpSections
-}
-
-func calculateVMPEntropy(pe *PEFile, vmpSections []int) float64 {
-	if len(vmpSections) == 0 {
-		return 0.0
-	}
-
-	totalEntropy := 0.0
-	count := 0
-
-	for _, idx := range vmpSections {
-		s := pe.sections[idx]
-		if s.SizeOfRawData == 0 {
-			continue
-		}
-
-		end := s.PointerToRawData + s.SizeOfRawData
-		if int(end) > len(pe.data) {
-			continue
-		}
-
-		sectionData := pe.data[s.PointerToRawData:end]
-		entropy := calculateEntropy(sectionData)
-		totalEntropy += entropy
-		count++
-	}
-
-	if count == 0 {
-		return 0.0
-	}
-	return totalEntropy / float64(count)
 }
 
 func calculateEntropy(data []byte) float64 {
@@ -1346,177 +1272,6 @@ func calculateEntropy(data []byte) float64 {
 	}
 
 	return entropy
-}
-
-func detectVMHandlers(pe *PEFile, vmpSections []int) int {
-	handlerCount := 0
-
-	vmHandlerPatterns := [][]byte{
-		parseHexPattern("FF 24 85 ?? ?? ?? ??"),
-		parseHexPattern("FF 24 8D ?? ?? ?? ??"),
-		parseHexPattern("FF 24 C5 ?? ?? ?? ??"),
-		parseHexPattern("41 FF 24 C4"),
-		parseHexPattern("8B ?? 24 ?? 8B ?? 24 ??"),
-		parseHexPattern("48 8B ?? 24 ?? 48 8B ?? 24 ??"),
-		parseHexPattern("AC ?? ?? ?? E0"),
-		parseHexPattern("0F B6 ?? 48 FF C?"),
-	}
-
-	for _, idx := range vmpSections {
-		s := pe.sections[idx]
-		if s.SizeOfRawData == 0 {
-			continue
-		}
-
-		end := s.PointerToRawData + s.SizeOfRawData
-		if int(end) > len(pe.data) {
-			continue
-		}
-
-		sectionData := pe.data[s.PointerToRawData:end]
-
-		for _, pattern := range vmHandlerPatterns {
-			handlerCount += countPatternOccurrences(sectionData, pattern)
-		}
-	}
-
-	handlerCount += detectDispatchTables(pe, vmpSections)
-
-	return handlerCount
-}
-
-func countPatternOccurrences(data, pattern []byte) int {
-	count := 0
-	offset := 0
-
-	for {
-		idx := findPattern(data[offset:], pattern)
-		if idx < 0 {
-			break
-		}
-		count++
-		offset += idx + len(pattern)
-		if offset >= len(data) {
-			break
-		}
-	}
-
-	return count
-}
-
-func detectDispatchTables(pe *PEFile, vmpSections []int) int {
-	tables := 0
-
-	for _, idx := range vmpSections {
-		s := pe.sections[idx]
-		if s.SizeOfRawData == 0 {
-			continue
-		}
-
-		end := s.PointerToRawData + s.SizeOfRawData
-		if int(end) > len(pe.data) {
-			continue
-		}
-
-		sectionData := pe.data[s.PointerToRawData:end]
-
-		ptrSize := 4
-		if pe.is64 {
-			ptrSize = 8
-		}
-
-		for i := 0; i+ptrSize*16 <= len(sectionData); i += ptrSize {
-			if isDispatchTable(sectionData[i:], pe, ptrSize) {
-				tables++
-				i += ptrSize * 32
-			}
-		}
-	}
-
-	return tables
-}
-
-func isDispatchTable(data []byte, pe *PEFile, ptrSize int) bool {
-	minEntries := 16
-	validPointers := 0
-
-	for i := 0; i < minEntries*ptrSize && i+ptrSize <= len(data); i += ptrSize {
-		var ptr uint32
-		if ptrSize == 4 {
-			ptr = binary.LittleEndian.Uint32(data[i:])
-		} else {
-			ptr64 := binary.LittleEndian.Uint64(data[i:])
-			ptr = uint32(ptr64)
-		}
-
-		if ptr > 0 && ptr < pe.sizeOfImage {
-			for _, s := range pe.sections {
-				if ptr >= s.VirtualAddress &&
-					ptr < s.VirtualAddress+s.VirtualSize &&
-					s.Characteristics&sectionMemExecute != 0 {
-					validPointers++
-					break
-				}
-			}
-		}
-	}
-
-	return float64(validPointers)/float64(minEntries) > 0.75
-}
-
-func analyzeCodeComplexity(pe *PEFile, vmpSections []int) float64 {
-	if len(vmpSections) == 0 {
-		return 0.0
-	}
-
-	totalComplexity := 0.0
-	count := 0
-
-	complexPatterns := [][]byte{
-		parseHexPattern("FF E?"),
-		parseHexPattern("FF ?? ??"),
-		parseHexPattern("FF 1?"),
-		parseHexPattern("FF ?? ?? ?? ?? ??"),
-		parseHexPattern("9C"),
-		parseHexPattern("9D"),
-		parseHexPattern("0F 31"),
-		parseHexPattern("0F 01"),
-	}
-
-	for _, idx := range vmpSections {
-		s := pe.sections[idx]
-		if s.SizeOfRawData == 0 {
-			continue
-		}
-
-		end := s.PointerToRawData + s.SizeOfRawData
-		if int(end) > len(pe.data) {
-			continue
-		}
-
-		sectionData := pe.data[s.PointerToRawData:end]
-
-		complexity := 0
-		for _, pattern := range complexPatterns {
-			complexity += countPatternOccurrences(sectionData, pattern)
-		}
-
-		normalizedComplexity := float64(complexity) / float64(len(sectionData)) * 1000.0
-		totalComplexity += normalizedComplexity
-		count++
-	}
-
-	if count == 0 {
-		return 0.0
-	}
-
-	complexity := totalComplexity / float64(count)
-
-	if complexity > 1.0 {
-		complexity = 1.0
-	}
-
-	return complexity
 }
 
 func main() {
